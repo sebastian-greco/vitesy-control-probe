@@ -8,6 +8,7 @@ import re
 import secrets
 import ssl
 import threading
+from collections import Counter
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -23,6 +24,27 @@ MAX_MESSAGES = 64
 REPLY_TIMEOUT = 6
 FIELD_NAMES = ("mode", "auto", "standby", "fan", "led_out", "led_in")
 WRITABLE_FIELDS = frozenset({"fan", "led_out"})
+_DIAGNOSTIC_FIELDS = frozenset(FIELD_NAMES) | {
+    "goal",
+    "utc",
+    "firmware",
+    "ble",
+    "realtime",
+    "led_rgb",
+    "purifier",
+    "connected",
+    "type",
+}
+_JSON_TYPES = {
+    type(None): "null",
+    bool: "boolean",
+    int: "integer",
+    float: "number",
+    str: "string",
+    list: "array",
+    dict: "object",
+}
+_OFF_RGB = [0, 0, 0]
 
 
 class ProbeError(Exception):
@@ -105,6 +127,7 @@ class Snapshot:
     reported_at: dict[str, int]
     desired_at: dict[str, int]
     pending: bool
+    awake_rgb_only_pending: bool
 
     @classmethod
     def parse(cls, doc: dict[str, Any]) -> Snapshot:
@@ -126,6 +149,22 @@ class Snapshot:
         ):
             raise ProbeError("invalid_shadow")
         metadata = doc.get("metadata")
+        pending_fields = set(delta) | {
+            key
+            for key, value in desired.items()
+            if key not in reported or not same_value(value, reported[key])
+        }
+        rgb = reported.get("led_rgb")
+        awake_rgb_only_pending = (
+            pending_fields == {"led_rgb"}
+            and reported.get("standby") is False
+            and same_value(desired.get("led_rgb"), _OFF_RGB)
+            and isinstance(rgb, list)
+            and len(rgb) == 3
+            and all(type(channel) is int and 0 <= channel <= 255 for channel in rgb)
+            and not same_value(rgb, _OFF_RGB)
+            and (not delta or same_value(delta.get("led_rgb"), _OFF_RGB))
+        )
         return cls(
             version,
             timestamp,
@@ -133,22 +172,35 @@ class Snapshot:
             desired,
             _field_times(metadata, "reported"),
             _field_times(metadata, "desired"),
-            bool(delta)
-            or any(
-                key not in reported or not same_value(value, reported[key])
-                for key, value in desired.items()
-            ),
+            bool(pending_fields),
+            awake_rgb_only_pending,
         )
 
     def public(self) -> dict[str, Any]:
+        desired = _project(self.desired)
+        unprojected = {
+            key: _JSON_TYPES.get(type(value), "unknown")
+            for key, value in self.desired.items()
+            if key not in desired
+        }
         return {
             "version": self.version,
             "cloud_timestamp": self.timestamp,
             "reported": dict(self.reported),
-            "desired": _project(self.desired),
+            "desired": desired,
+            "unprojected_desired": {
+                "count": len(unprojected),
+                "types": dict(Counter(unprojected.values())),
+                "known_fields": {
+                    key: kind
+                    for key, kind in unprojected.items()
+                    if key in _DIAGNOSTIC_FIELDS
+                },
+            },
             "reported_at": dict(self.reported_at),
             "desired_at": dict(self.desired_at),
             "pending": self.pending,
+            "awake_rgb_only_pending": self.awake_rgb_only_pending,
         }
 
 

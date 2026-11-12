@@ -21,7 +21,7 @@ from .experiment import exercise, test_readiness
 from .off_experiment import exercise_off, is_off_baseline
 from .shadow import DEVICE_ID, HOST, PORT, ProbeError, Snapshot, open_shadow
 
-DOMAIN = "vitesy_control_probe2"
+DOMAIN = "vitesy_control_probe3"
 SOURCE_DOMAIN = "vitesy_web"
 TARGET_MODEL = "ETERIA"
 TARGET_FIRMWARE = "1.1.11"

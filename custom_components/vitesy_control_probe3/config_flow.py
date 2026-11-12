@@ -31,7 +31,7 @@ class VitesyControlProbeFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = str(error)
             else:
                 return self.async_create_entry(
-                    title="Vitesy Control Probe 2",
+                    title="Vitesy Control Probe 3",
                     data={
                         "source_entry_id": entry_id,
                         "device_name": name,

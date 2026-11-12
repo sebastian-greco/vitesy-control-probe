@@ -12,9 +12,9 @@ import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import Unauthorized
 
-from custom_components import vitesy_control_probe2 as integration
-from custom_components.vitesy_control_probe2 import experiment, off_experiment
-from custom_components.vitesy_control_probe2.shadow import (
+from custom_components import vitesy_control_probe3 as integration
+from custom_components.vitesy_control_probe3 import experiment, off_experiment
+from custom_components.vitesy_control_probe3.shadow import (
     PatchAck,
     ProbeError,
     Rejected,
@@ -107,8 +107,12 @@ class FakeShadow:
 
 
 class FakeOffShadow(FakeShadow):
-    def __init__(self, *, latent_auto=False, correction_flag=False, behavior=None):
+    def __init__(
+        self, *, latent_auto=False, correction_flag=False, behavior=None, extras=None
+    ):
         super().__init__(desired={"mode": "off", "standby": True})
+        self.extras = dict(extras or {})
+        self.desired.update(self.extras)
         self.reported = {
             "mode": "off",
             "standby": True,
@@ -117,6 +121,7 @@ class FakeOffShadow(FakeShadow):
             "led_out": 0,
             "led_in": 0,
         }
+        self.reported.update(self.extras)
         self.reported_at = dict.fromkeys(self.reported, 100)
         self.latent_auto = latent_auto
         self.correction_flag = correction_flag
@@ -133,6 +138,13 @@ class FakeOffShadow(FakeShadow):
     def publish_report(self, **fields):
         self.version += 1
         self.reported.update(fields)
+        if self.reported["standby"]:
+            self.reported.update(self.extras)
+        else:
+            if "led_rgb" in self.extras:
+                self.reported["led_rgb"] = [245, 250, 255]
+            if self.behavior == "unrelated_pending":
+                self.reported["goal"] = "allergy"
         self.reported_at = dict.fromkeys(self.reported, self.cloud_timestamp)
 
     def rewrite_desired(self, **patch):
@@ -202,6 +214,8 @@ class FakeOffShadow(FakeShadow):
                     self.rewrite_desired(standby=False, auto=False)
             if self.behavior == "interference":
                 self.rewrite_desired(mode="external")
+            if self.behavior == "extra_interference":
+                self.rewrite_desired(goal="allergy")
             if self.behavior == "lost_applied":
                 raise TimeoutError
         elif patch.get("mode") == "off":
@@ -231,11 +245,25 @@ def fast_off(monkeypatch):
 @pytest.mark.parametrize(
     "latent_auto, correction_flag", [(False, False), (True, False), (False, True)]
 )
+@pytest.mark.parametrize(
+    "extras",
+    [
+        None,
+        {
+            "led_rgb": [0, 0, 0],
+            "goal": "general",
+            "opaque-private-field": {"token": "test-secret", "array": [1, True]},
+            "unknown_null": None,
+        },
+    ],
+)
 @pytest.mark.asyncio
 async def test_off_test_verifies_reports_and_restores_exact_off_shape(
-    latent_auto, correction_flag, fast_off
+    latent_auto, correction_flag, extras, fast_off
 ):
-    shadow = FakeOffShadow(latent_auto=latent_auto, correction_flag=correction_flag)
+    shadow = FakeOffShadow(
+        latent_auto=latent_auto, correction_flag=correction_flag, extras=extras
+    )
     before = await shadow.get()
     report = {}
     assert integration._readiness(before) is None
@@ -245,10 +273,24 @@ async def test_off_test_verifies_reports_and_restores_exact_off_shape(
     assert report["front_led"]["reported"]["led_out"] == 100
     assert report["restoration"] == "confirmed"
     assert report["restored_state"]["reported"] == before.reported
-    assert report["restored_state"]["desired"] == before.desired
+    assert report["restored_state"]["desired"] == before.public()["desired"]
+    assert (await shadow.get()).desired == before.desired
     assert ("firmware_auto_correction" in report) is latent_auto
     assert all("led_in" not in patch for patch in shadow.writes)
     assert len(shadow.writes) == 3 + int(latent_auto) + int(correction_flag)
+    if extras:
+        assert all(not patch.keys() & extras.keys() for patch in shadow.writes)
+        assert report["fan"]["awake_rgb_only_pending"]
+        assert not report["restored_state"]["pending"]
+        assert report["restored_state"]["unprojected_desired"] == {
+            "count": 4,
+            "types": {"array": 1, "string": 1, "object": 1, "null": 1},
+            "known_fields": {"led_rgb": "array", "goal": "string"},
+        }
+        serialized = json.dumps(report)
+        assert (
+            "opaque-private-field" not in serialized and "test-secret" not in serialized
+        )
 
 
 @pytest.mark.parametrize(
@@ -305,7 +347,7 @@ async def test_off_test_cancellation_after_fan_report_confirms_off(fast_off):
 
 
 @pytest.mark.asyncio
-async def test_off_baseline_with_unknown_desired_field_never_writes(fast_off):
+async def test_off_baseline_with_unsettled_desired_field_never_writes(fast_off):
     shadow = FakeOffShadow()
     shadow.desired["other"] = True
     with pytest.raises(ProbeError, match="off_test_baseline_not_supported"):
@@ -313,6 +355,116 @@ async def test_off_baseline_with_unknown_desired_field_never_writes(fast_off):
             shadow.open, await shadow.get(), lambda: None, {}
         )
     assert shadow.writes == []
+
+
+@pytest.mark.asyncio
+async def test_off_baseline_with_extra_controlled_field_never_writes(fast_off):
+    shadow = FakeOffShadow()
+    shadow.desired["led_in"] = 0
+    with pytest.raises(ProbeError, match="off_test_baseline_not_supported"):
+        await off_experiment.exercise_off(
+            shadow.open, await shadow.get(), lambda: None, {}
+        )
+    assert shadow.writes == []
+
+
+@pytest.mark.asyncio
+async def test_off_rechecks_unrelated_desired_fields_before_first_write(fast_off):
+    shadow = FakeOffShadow(extras={"opaque": {"flag": True}})
+    baseline = await shadow.get()
+    shadow.rewrite_desired(opaque={"flag": 1})
+    shadow.reported["opaque"] = {"flag": 1}
+    assert off_experiment.is_off_baseline(await shadow.get())
+    with pytest.raises(ProbeError, match="inspected_baseline_changed"):
+        await off_experiment.exercise_off(shadow.open, baseline, lambda: None, {})
+    assert shadow.writes == []
+
+
+@pytest.mark.asyncio
+async def test_off_never_overwrites_external_change_to_unrelated_desired_field(
+    fast_off,
+):
+    shadow = FakeOffShadow(extras={"goal": "general"}, behavior="extra_interference")
+    report = {}
+    with pytest.raises(ProbeError, match="off_test_desired_changed"):
+        await off_experiment.exercise_off(
+            shadow.open, await shadow.get(), lambda: None, report
+        )
+    assert len(shadow.writes) == 1
+    assert shadow.desired["goal"] == "allergy"
+    assert report["restoration"] == "unconfirmed"
+
+
+@pytest.mark.parametrize("latent_auto", [False, True])
+@pytest.mark.asyncio
+async def test_rgb_exception_does_not_ignore_other_pending_fields(
+    latent_auto, fast_off
+):
+    shadow = FakeOffShadow(
+        extras={"goal": "general", "led_rgb": [0, 0, 0]},
+        behavior="unrelated_pending",
+        latent_auto=latent_auto,
+    )
+    report = {}
+    with pytest.raises(ProbeError, match="off_test_no_fresh_report"):
+        await off_experiment.exercise_off(
+            shadow.open, await shadow.get(), lambda: None, report
+        )
+    assert "fan" not in report and "front_led" not in report
+    assert len(shadow.writes) == 2
+    assert report["restoration"] == "confirmed"
+
+
+@pytest.mark.parametrize(
+    "reported, desired, delta, expected",
+    [
+        (
+            {"standby": False, "led_rgb": [245, 250, 255]},
+            {"led_rgb": [0, 0, 0]},
+            {"led_rgb": [0, 0, 0]},
+            True,
+        ),
+        (
+            {"standby": True, "led_rgb": [245, 250, 255]},
+            {"led_rgb": [0, 0, 0]},
+            {"led_rgb": [0, 0, 0]},
+            False,
+        ),
+        (
+            {"standby": False, "led_rgb": [245, 250, True]},
+            {"led_rgb": [0, 0, 0]},
+            {},
+            False,
+        ),
+        (
+            {"standby": False, "led_rgb": [245, 250, 255]},
+            {"led_rgb": [0, 0, 0]},
+            {"led_rgb": [0, 0, 1]},
+            False,
+        ),
+        (
+            {"standby": False, "led_rgb": [245, 250, 255]},
+            {"led_rgb": [0, 0, 0]},
+            {"other": True},
+            False,
+        ),
+    ],
+)
+def test_rgb_pending_exception_requires_exact_documented_shape(
+    reported, desired, delta, expected
+):
+    state = Snapshot.parse(
+        {
+            "version": 1,
+            "timestamp": 100,
+            "state": {
+                "reported": reported,
+                "desired": desired,
+                "delta": delta,
+            },
+        }
+    )
+    assert state.pending and state.awake_rgb_only_pending is expected
 
 
 @pytest.mark.asyncio

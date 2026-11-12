@@ -35,10 +35,13 @@ _PAUSE = 1.6
 
 def is_off_baseline(state: Snapshot) -> bool:
     """Recognize precisely the supported observable Off configuration."""
+    desired_controls = {
+        key: value for key, value in state.desired.items() if key in FIELD_NAMES
+    }
     return (
         not state.pending
         and same_value(state.reported, _OFF_REPORTED)
-        and same_value(state.desired, _OFF_DESIRED)
+        and same_value(desired_controls, _OFF_DESIRED)
         and set(FIELD_NAMES) <= state.reported_at.keys()
         and _OFF_DESIRED.keys() <= state.desired_at.keys()
     )
@@ -53,11 +56,13 @@ class _Write:
     reasserted: dict[str, int] = dataclass_field(default_factory=dict)
 
     def expected(self) -> dict[str, Any]:
-        return {
-            key: value
-            for key, value in (self.before.desired | self.patch).items()
-            if value is not None
-        }
+        desired = self.before.desired.copy()
+        for key, value in self.patch.items():
+            if value is None:
+                desired.pop(key, None)
+            else:
+                desired[key] = value
+        return desired
 
 
 def _fresh(state: Snapshot, write: _Write, fields: set[str]) -> bool:
@@ -97,6 +102,10 @@ def _desired_owned(state: Snapshot, write: _Write, expected: dict[str, Any]) -> 
         return False
     reasserted = {}
     for field, value in expected.items():
+        if field not in FIELD_NAMES:
+            # Complete value/type equality was checked above. We neither
+            # write these fields nor need to claim their timestamp ownership.
+            continue
         actual = state.desired_at.get(field)
         if field in write.patch:
             original = ack.desired_at.get(field, ack.timestamp)
@@ -124,6 +133,8 @@ def _frame(state: Snapshot, write: _Write) -> str:
     if not set(FIELD_NAMES) <= state.reported.keys():
         raise ProbeError("off_test_incomplete_report")
     reported = state.reported
+    expected = write.expected()
+    settled = not state.pending or state.awake_rgb_only_pending
     awake_auto = (
         reported["mode"] == "manual"
         and reported["standby"] is False
@@ -134,23 +145,22 @@ def _frame(state: Snapshot, write: _Write) -> str:
             or (reported["fan"] == 25 and reported["led_out"] == 0)
         )
     )
-    if (
-        write.stage in {"wake", "disable_auto"}
-        and awake_auto
-        and (
-            not state.pending
-            and _fresh(state, write, set(FIELD_NAMES))
-            and _desired_owned(
-                state, write, {"mode": "manual", "standby": False, "auto": True}
-            )
-            and state.desired_at.get("auto") == state.reported_at.get("auto")
-        )
-    ):
+    if write.stage in {"wake", "disable_auto"} and awake_auto:
         # AWS suppresses delta fields equal to the masked Off report. A unit
         # with retained Auto can therefore wake before receiving auto:false.
-        return "auto"
+        auto_correction = {
+            key: value
+            for key, value in expected.items()
+            if key not in {"fan", "led_in", "led_out"}
+        } | {"auto": True}
+        if (
+            _fresh(state, write, set(FIELD_NAMES))
+            and state.desired_at.get("auto") == state.reported_at.get("auto")
+            and _desired_owned(state, write, auto_correction)
+        ):
+            return "auto" if settled else "pending"
 
-    if not _desired_owned(state, write, write.expected()):
+    if not _desired_owned(state, write, expected):
         raise ProbeError("off_test_desired_changed")
     if same_value(reported, write.before.reported):
         return "pending"
@@ -160,11 +170,7 @@ def _frame(state: Snapshot, write: _Write) -> str:
         expected = write.before.reported | _LED
         if not same_value(reported, expected):
             raise ProbeError("off_test_other_reported_fields_changed")
-        return (
-            "led"
-            if not state.pending and _fresh(state, write, {"led_out"})
-            else "pending"
-        )
+        return "led" if settled and _fresh(state, write, {"led_out"}) else "pending"
 
     if all(
         same_value(reported.get(field), value)
@@ -179,7 +185,7 @@ def _frame(state: Snapshot, write: _Write) -> str:
             "manual"
             if (
                 reported["led_out"] == 0
-                and not state.pending
+                and settled
                 and _fresh(state, write, set(FIELD_NAMES))
             )
             else "pending"
@@ -188,11 +194,17 @@ def _frame(state: Snapshot, write: _Write) -> str:
 
 
 class _OffTest:
-    def __init__(self, open_shadow: Callable, report: dict[str, Any]) -> None:
+    def __init__(
+        self, open_shadow: Callable, baseline: Snapshot, report: dict[str, Any]
+    ) -> None:
         self.open = open_shadow
+        self.off_desired = baseline.desired.copy()
         self.report = report
         self.current: _Write | None = None
         self.previous: _Write | None = None
+
+    def matches_off(self, state: Snapshot) -> bool:
+        return is_off_baseline(state) and same_value(state.desired, self.off_desired)
 
     async def send(self, shadow: ShadowSession, write: _Write) -> None:
         self.previous, self.current = self.current, write
@@ -253,7 +265,7 @@ class _OffTest:
         latest = self.current
         state = await shadow.get()
         fence_unaccepted_wake = False
-        if is_off_baseline(state):
+        if self.matches_off(state):
             if state.version > latest.before.version:
                 if latest.ack is not None and _fresh_off(state, latest):
                     return await self.confirm_stable(shadow, state), "fresh_off_report"
@@ -283,8 +295,8 @@ class _OffTest:
         for attempt in range(_ATTEMPTS):
             current = await shadow.get()
             if (
-                is_off_baseline(current)
-                and _desired_owned(current, off, _OFF_DESIRED)
+                self.matches_off(current)
+                and _desired_owned(current, off, self.off_desired)
                 and (fence_unaccepted_wake or _fresh_off(current, off))
             ):
                 evidence = (
@@ -299,28 +311,27 @@ class _OffTest:
                 same_value(current.reported, _OFF_REPORTED)
                 and not current.pending
                 and _fresh_off(current, off)
-                and _desired_owned(current, off, _OFF_DESIRED | {"auto": False})
+                and _desired_owned(current, off, self.off_desired | {"auto": False})
                 and current.desired_at.get("auto") == current.reported_at.get("auto")
             ):
                 cleared = await shadow.update_patch(current, {"auto": None})
                 clean = await shadow.get()
-                if clean.version >= cleared.version and is_off_baseline(clean):
+                if clean.version >= cleared.version and self.matches_off(clean):
                     return await self.confirm_stable(shadow, clean), "fresh_off_report"
                 raise ProbeError("off_restore_auto_cleanup_unconfirmed")
-            if not _desired_owned(current, off, _OFF_DESIRED):
+            if not _desired_owned(current, off, self.off_desired):
                 raise ProbeError("off_restore_desired_changed")
             if attempt + 1 < _ATTEMPTS:
                 await asyncio.sleep(_PAUSE)
         raise ProbeError("off_restore_no_fresh_report")
 
-    @staticmethod
-    async def confirm_stable(shadow: ShadowSession, first: Snapshot) -> Snapshot:
+    async def confirm_stable(self, shadow: ShadowSession, first: Snapshot) -> Snapshot:
         await asyncio.sleep(_PAUSE)
         current = await shadow.get()
         if (
             current.version < first.version
             or current.timestamp < first.timestamp
-            or not is_off_baseline(current)
+            or not self.matches_off(current)
         ):
             raise ProbeError("off_restore_not_stable")
         return current
@@ -369,14 +380,14 @@ async def exercise_off(
     """Run only from the verified Off profile and shield its bounded restoration."""
     if not is_off_baseline(baseline):
         raise ProbeError("off_test_baseline_not_supported")
-    run = _OffTest(open_shadow, report)
+    run = _OffTest(open_shadow, baseline, report)
     report.update(test_strategy="wake_from_off", original_state=baseline.public())
     async with open_shadow(write=True) as shadow:
         start = await shadow.get()
         if (
             start.version < baseline.version
             or start.timestamp < baseline.timestamp
-            or not is_off_baseline(start)
+            or not run.matches_off(start)
         ):
             raise ProbeError("inspected_baseline_changed")
         try:

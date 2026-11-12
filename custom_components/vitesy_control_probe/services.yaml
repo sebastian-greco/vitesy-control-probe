@@ -1,0 +1,9 @@
+read_state:
+  name: Read the selected Eteria's state
+  description: Start a read-only MQTT shadow check using the running Vitesy Web TLS context.
+start_test:
+  name: Test the selected Eteria's controls
+  description: Test a small fan change and front LED toggle, restoring each setting before continuing.
+status:
+  name: Get probe status
+  description: Read the current operation status and sanitized device-reported results.

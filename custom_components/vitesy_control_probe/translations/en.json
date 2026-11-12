@@ -1,0 +1,30 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Select one connected Eteria",
+        "description": "Use a loaded Vitesy Web entry and the exact device name reported by Vitesy. Adding this probe does not connect to the broker or change device settings.",
+        "data": {
+          "source_entry_id": "Vitesy Web config entry ID",
+          "device_name": "Exact Eteria device name"
+        }
+      }
+    },
+    "error": {
+      "invalid_probe_target": "Enter a valid entry ID and printable device name.",
+      "source_entry_not_loaded": "The selected Vitesy Web entry is not loaded.",
+      "source_inventory_unavailable": "The selected entry has no usable device inventory.",
+      "target_device_not_unique": "No unique device matches that name in the entry's inventory.",
+      "target_device_identity_mismatch": "The selected device is not a supported Eteria running firmware 1.1.11.",
+      "target_not_in_running_mqtt_session": "The selected Eteria is absent from the current MQTT session.",
+      "source_mqtt_not_connected": "The selected entry does not have a connected MQTT session.",
+      "source_mqtt_client_mismatch": "The selected entry does not have the expected MQTT client.",
+      "source_mqtt_tls_context_mismatch": "The current MQTT client does not expose the expected verified TLS context.",
+      "unsupported_source_coordinator": "The selected entry does not have the expected Vitesy Web coordinator.",
+      "unsupported_paho_version": "The probe requires the existing Paho MQTT 2.1.0 client."
+    },
+    "abort": {
+      "already_configured": "A probe is already configured."
+    }
+  }
+}

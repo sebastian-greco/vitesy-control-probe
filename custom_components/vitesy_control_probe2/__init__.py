@@ -18,15 +18,22 @@ from paho.mqtt import __version__ as PAHO_VERSION
 from paho.mqtt.client import Client
 
 from .experiment import exercise, test_readiness
+from .off_experiment import exercise_off, is_off_baseline
 from .shadow import DEVICE_ID, HOST, PORT, ProbeError, Snapshot, open_shadow
 
-DOMAIN = "vitesy_control_probe"
+DOMAIN = "vitesy_control_probe2"
 SOURCE_DOMAIN = "vitesy_web"
 TARGET_MODEL = "ETERIA"
 TARGET_FIRMWARE = "1.1.11"
 SERVICES = ("read_state", "start_test", "status")
 BASELINE_LIFETIME = 300
 _LOGGER = logging.getLogger(__name__)
+
+
+def _readiness(state: Snapshot) -> str | None:
+    if is_off_baseline(state):
+        return None
+    return test_readiness(state)
 
 
 @dataclass(frozen=True)
@@ -175,7 +182,7 @@ class Probe:
                 raise HomeAssistantError(
                     "Read and inspect the selected device's state before starting the test"
                 )
-            if (reason := test_readiness(prior[0])) is not None:
+            if (reason := _readiness(prior[0])) is not None:
                 raise HomeAssistantError(reason)
         self.baseline = None
         self.report = {
@@ -202,7 +209,11 @@ class Probe:
                     asyncio.get_running_loop().time() + BASELINE_LIFETIME,
                 )
                 self.report.update(
-                    state=snapshot.public(), test_blocked_by=test_readiness(snapshot)
+                    state=snapshot.public(),
+                    test_blocked_by=_readiness(snapshot),
+                    test_strategy="wake_from_off"
+                    if is_off_baseline(snapshot)
+                    else "active_manual",
                 )
             else:
                 if prior is None:
@@ -216,7 +227,8 @@ class Probe:
                     ):
                         raise ProbeError("source_session_changed")
 
-                await exercise(source.open, prior, still_same_source, self.report)
+                test_operation = exercise_off if is_off_baseline(prior) else exercise
+                await test_operation(source.open, prior, still_same_source, self.report)
         except asyncio.CancelledError:
             self.report.update(status="cancelled")
             raise

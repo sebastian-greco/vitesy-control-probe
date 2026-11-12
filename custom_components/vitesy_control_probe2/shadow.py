@@ -159,6 +159,25 @@ class UpdateAck:
     desired_at: int | None
 
 
+@dataclass(frozen=True)
+class PatchAck:
+    version: int
+    timestamp: int
+    desired_at: dict[str, int]
+
+
+def _valid_patch_field(field: str, value: Any) -> bool:
+    if field in WRITABLE_FIELDS:
+        return value is None or _intensity(value)
+    if field == "mode":
+        return type(value) is str and value in {"off", "manual"}
+    if field == "standby":
+        return type(value) is bool
+    if field == "auto":
+        return value is False or value is None
+    return False
+
+
 class ShadowSession:
     """A separate, short-lived Paho client reusing an existing TLS context."""
 
@@ -354,12 +373,19 @@ class ShadowSession:
     async def update(
         self, before: Snapshot, field: str, value: int | None
     ) -> UpdateAck:
-        if field not in WRITABLE_FIELDS or (
-            value is not None and not _intensity(value)
+        if field not in WRITABLE_FIELDS:
+            raise ProbeError("invalid_update")
+        ack = await self.update_patch(before, {field: value})
+        return UpdateAck(ack.version, ack.timestamp, ack.desired_at.get(field))
+
+    async def update_patch(self, before: Snapshot, patch: dict[str, Any]) -> PatchAck:
+        """Conditionally change only supported controls on the pinned shadow."""
+        if not patch or any(
+            not _valid_patch_field(field, value) for field, value in patch.items()
         ):
             raise ProbeError("invalid_update")
         doc = await self._request(
-            "update", {"state": {"desired": {field: value}}, "version": before.version}
+            "update", {"state": {"desired": patch}, "version": before.version}
         )
         version, timestamp = (
             _counter(doc.get(key)) for key in ("version", "timestamp")
@@ -370,17 +396,16 @@ class ShadowSession:
             version != before.version + 1
             or timestamp is None
             or timestamp < before.timestamp
-            or (
-                value is not None
-                and (
-                    not isinstance(desired, dict)
-                    or not same_value(desired.get(field), value)
+            or any(
+                not same_value(
+                    desired.get(field) if isinstance(desired, dict) else None, value
                 )
+                for field, value in patch.items()
             )
         ):
             raise ProbeError("invalid_update_acknowledgement")
-        return UpdateAck(
-            version, timestamp, _field_times(doc.get("metadata"), "desired").get(field)
+        return PatchAck(
+            version, timestamp, _field_times(doc.get("metadata"), "desired")
         )
 
     async def close(self) -> None:

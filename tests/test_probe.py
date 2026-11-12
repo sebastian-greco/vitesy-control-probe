@@ -9,18 +9,19 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
-from custom_components.vitesy_control_probe import experiment
-from custom_components.vitesy_control_probe.shadow import (
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import Unauthorized
+
+from custom_components import vitesy_control_probe2 as integration
+from custom_components.vitesy_control_probe2 import experiment, off_experiment
+from custom_components.vitesy_control_probe2.shadow import (
+    PatchAck,
     ProbeError,
     Rejected,
     Snapshot,
     UpdateAck,
     open_shadow,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import Unauthorized
-
-from custom_components import vitesy_control_probe as integration
 
 
 class FakeShadow:
@@ -42,6 +43,10 @@ class FakeShadow:
         self.error = None
         self.behavior = None
 
+    @property
+    def cloud_timestamp(self):
+        return 100 + self.version
+
     async def get(self):
         return Snapshot.parse(
             {
@@ -60,7 +65,7 @@ class FakeShadow:
                     },
                 },
                 "version": self.version,
-                "timestamp": 100 + self.version,
+                "timestamp": self.cloud_timestamp,
             }
         )
 
@@ -99,6 +104,215 @@ class FakeShadow:
             self.desired_at[field] += 1
             self.version += 1
         return ack
+
+
+class FakeOffShadow(FakeShadow):
+    def __init__(self, *, latent_auto=False, correction_flag=False, behavior=None):
+        super().__init__(desired={"mode": "off", "standby": True})
+        self.reported = {
+            "mode": "off",
+            "standby": True,
+            "auto": False,
+            "fan": 0,
+            "led_out": 0,
+            "led_in": 0,
+        }
+        self.reported_at = dict.fromkeys(self.reported, 100)
+        self.latent_auto = latent_auto
+        self.correction_flag = correction_flag
+        self.behavior = behavior
+        self.pending_led_delta = False
+        self.pending_version = None
+
+    @property
+    def cloud_timestamp(self):
+        if self.behavior in {"stale_off_readback", "stale_already_off"}:
+            return 100
+        return super().cloud_timestamp
+
+    def publish_report(self, **fields):
+        self.version += 1
+        self.reported.update(fields)
+        self.reported_at = dict.fromkeys(self.reported, self.cloud_timestamp)
+
+    def rewrite_desired(self, **patch):
+        for field, value in patch.items():
+            if value is None:
+                self.desired.pop(field, None)
+                self.desired_at.pop(field, None)
+            else:
+                self.desired[field] = value
+                self.desired_at[field] = self.cloud_timestamp
+
+    async def get(self):
+        state = await super().get()
+        if self.pending_led_delta:
+            self.pending_led_delta = False
+            self.publish_report(led_out=0)
+        return state
+
+    async def update_patch(self, before, patch):
+        assert before.version == self.version
+        assert "led_in" not in patch
+        self.writes.append(patch.copy())
+        first = len(self.writes) == 1
+        if first and self.behavior == "reject_wake":
+            raise Rejected("shadow_update_rejected_409")
+        if first and self.behavior == "lost_unapplied":
+            self.pending_version = before.version
+            raise TimeoutError
+        if patch == {"led_out": 100} and self.behavior == "reject_led":
+            raise Rejected("shadow_update_rejected_409")
+        self.version += 1
+        self.rewrite_desired(**patch)
+        ack = PatchAck(self.version, self.cloud_timestamp, self.desired_at.copy())
+        assert ack.timestamp >= before.timestamp
+        if self.behavior in {"stale_off_readback", "stale_already_off"}:
+            # Keep all reports and acknowledgements in the same second. An
+            # unrelated cloud write can advance version without a device report.
+            if self.behavior == "stale_already_off" or patch.get("mode") == "off":
+                self.version += 1
+                self.rewrite_desired(
+                    mode="off", standby=True, fan=None, led_out=None, auto=None
+                )
+            return ack
+        if patch.get("mode") == "manual":
+            # Standby masks previous requests. AWS only sends differing values.
+            if self.latent_auto:
+                self.publish_report(
+                    mode="manual",
+                    standby=False,
+                    auto=True,
+                    fan=50,
+                    led_out=42,
+                    led_in=100,
+                )
+                self.rewrite_desired(auto=True, fan=None, led_out=None, led_in=None)
+            else:
+                self.publish_report(
+                    mode="manual",
+                    standby=False,
+                    auto=False,
+                    fan=25,
+                    led_out=42,
+                    led_in=61,
+                )
+                self.pending_led_delta = True
+                if self.correction_flag:
+                    self.rewrite_desired(standby=False, auto=False)
+            if self.behavior == "interference":
+                self.rewrite_desired(mode="external")
+            if self.behavior == "lost_applied":
+                raise TimeoutError
+        elif patch.get("mode") == "off":
+            if self.behavior != "off_no_report" and not before.reported["standby"]:
+                self.publish_report(
+                    mode="off", standby=True, auto=False, fan=0, led_out=0, led_in=0
+                )
+                self.rewrite_desired(
+                    standby=True,
+                    fan=None,
+                    led_out=None,
+                    led_in=None,
+                    auto=False if self.correction_flag else None,
+                )
+        elif patch.get("auto") is False:
+            self.publish_report(auto=False, fan=25, led_out=0)
+        elif patch == {"led_out": 100}:
+            self.publish_report(led_out=100)
+        return ack
+
+
+@pytest.fixture
+def fast_off(monkeypatch):
+    monkeypatch.setattr(off_experiment, "_PAUSE", 0)
+
+
+@pytest.mark.parametrize(
+    "latent_auto, correction_flag", [(False, False), (True, False), (False, True)]
+)
+@pytest.mark.asyncio
+async def test_off_test_verifies_reports_and_restores_exact_off_shape(
+    latent_auto, correction_flag, fast_off
+):
+    shadow = FakeOffShadow(latent_auto=latent_auto, correction_flag=correction_flag)
+    before = await shadow.get()
+    report = {}
+    assert integration._readiness(before) is None
+    await off_experiment.exercise_off(shadow.open, before, lambda: None, report)
+    assert report["fan"]["reported"]["fan"] == 25
+    assert report["fan"]["reported"]["led_in"] == (100 if latent_auto else 61)
+    assert report["front_led"]["reported"]["led_out"] == 100
+    assert report["restoration"] == "confirmed"
+    assert report["restored_state"]["reported"] == before.reported
+    assert report["restored_state"]["desired"] == before.desired
+    assert ("firmware_auto_correction" in report) is latent_auto
+    assert all("led_in" not in patch for patch in shadow.writes)
+    assert len(shadow.writes) == 3 + int(latent_auto) + int(correction_flag)
+
+
+@pytest.mark.parametrize(
+    "behavior, error, outcome",
+    [
+        ("reject_wake", Rejected, None),
+        ("reject_led", Rejected, "confirmed"),
+        ("lost_unapplied", TimeoutError, "unchanged_off_fenced"),
+        ("lost_applied", TimeoutError, "unconfirmed"),
+        ("interference", ProbeError, "unconfirmed"),
+        ("off_no_report", ProbeError, "unconfirmed"),
+        ("stale_off_readback", ProbeError, "unconfirmed"),
+        ("stale_already_off", ProbeError, "unconfirmed"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_off_recovery_uses_owned_state_and_never_claims_unreported_off(
+    behavior, error, outcome, fast_off
+):
+    shadow = FakeOffShadow(behavior=behavior)
+    before = await shadow.get()
+    report = {}
+    with pytest.raises(error):
+        await off_experiment.exercise_off(shadow.open, before, lambda: None, report)
+    assert report.get("restoration") == outcome
+    if behavior in {"reject_wake", "lost_applied", "interference"}:
+        assert len(shadow.writes) == 1
+    if behavior == "lost_unapplied":
+        assert shadow.connections == 2
+        assert shadow.version > shadow.pending_version
+        assert report["restoration_evidence"] == "unchanged_off_version_fence"
+    if behavior in {"stale_off_readback", "stale_already_off"}:
+        assert report["restore_unconfirmed"] == "off_restore_no_fresh_report"
+    if outcome == "confirmed":
+        assert (await shadow.get()).reported == before.reported
+
+
+@pytest.mark.asyncio
+async def test_off_test_cancellation_after_fan_report_confirms_off(fast_off):
+    shadow = FakeOffShadow()
+    before = await shadow.get()
+    report = {}
+    task = asyncio.create_task(
+        off_experiment.exercise_off(shadow.open, before, lambda: None, report)
+    )
+    async with asyncio.timeout(1):
+        while "fan" not in report:
+            await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert report["restoration"] == "confirmed"
+    assert (await shadow.get()).reported == before.reported
+
+
+@pytest.mark.asyncio
+async def test_off_baseline_with_unknown_desired_field_never_writes(fast_off):
+    shadow = FakeOffShadow()
+    shadow.desired["other"] = True
+    with pytest.raises(ProbeError, match="off_test_baseline_not_supported"):
+        await off_experiment.exercise_off(
+            shadow.open, await shadow.get(), lambda: None, {}
+        )
+    assert shadow.writes == []
 
 
 @pytest.mark.asyncio
@@ -252,6 +466,70 @@ class FakeMqttClient:
 
     def _sock_close(self):
         self.closed = True
+
+
+class FakePatchClient(FakeMqttClient):
+    def publish(self, topic, body, *, qos, retain):
+        if not topic.endswith("/update"):
+            return super().publish(topic, body, qos=qos, retain=retain)
+        request = json.loads(body)
+        self.writes.append((topic, request, qos, retain))
+        payload = json.dumps(
+            {
+                "clientToken": request["clientToken"],
+                "version": request["version"] + 1,
+                "timestamp": 101,
+                "state": {
+                    "desired": {
+                        field: value
+                        for field, value in request["state"]["desired"].items()
+                        if value is not None
+                    }
+                },
+            }
+        )
+        self.on_message(
+            self,
+            None,
+            SimpleNamespace(
+                topic=f"{topic}/accepted",
+                payload=payload.encode(),
+                retain=False,
+                dup=False,
+            ),
+        )
+        return SimpleNamespace(rc=0)
+
+
+@pytest.mark.asyncio
+async def test_off_transport_patch_is_exact_and_does_not_allow_inner_led_or_auto_enable():
+    async with open_shadow(
+        ssl.create_default_context(), FakePatchClient, "TEST:CaSe", write=True
+    ) as session:
+        before = await session.get()
+        for invalid in (
+            {"led_in": 0},
+            {"auto": True},
+            {"mode": "schedule"},
+            {"standby": 1},
+        ):
+            with pytest.raises(ProbeError, match="invalid_update"):
+                await session.update_patch(before, invalid)
+        patch = {
+            "mode": "off",
+            "standby": True,
+            "auto": None,
+            "fan": None,
+            "led_out": None,
+        }
+        ack = await session.update_patch(before, patch)
+        assert ack.version == before.version + 1
+        _, (topic, update, qos, retain) = session.client.writes
+        assert (
+            topic == "$aws/things/TEST:CaSe/shadow/update" and qos == 1 and not retain
+        )
+        assert update["version"] == before.version
+        assert update["state"] == {"desired": patch}
 
 
 @pytest.mark.asyncio

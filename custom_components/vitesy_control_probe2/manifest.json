@@ -1,11 +1,11 @@
 {
-  "domain": "vitesy_control_probe",
-  "name": "Vitesy Control Probe",
+  "domain": "vitesy_control_probe2",
+  "name": "Vitesy Control Probe 2",
   "codeowners": ["@sebastian-greco"],
   "config_flow": true,
   "documentation": "https://github.com/sebastian-greco/vitesy-control-probe",
   "integration_type": "service",
   "iot_class": "cloud_push",
   "requirements": [],
-  "version": "0.1.0"
+  "version": "0.2.0"
 }

@@ -3,7 +3,7 @@ read_state:
   description: Start a read-only MQTT shadow check using the running Vitesy Web TLS context.
 start_test:
   name: Test the selected Eteria's controls
-  description: Test a small fan change and front LED toggle, restoring each setting before continuing.
+  description: Test the fan and front LED, then restore the active manual settings or return the device to Off.
 status:
   name: Get probe status
   description: Read the current operation status and sanitized device-reported results.
